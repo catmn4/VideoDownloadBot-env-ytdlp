@@ -1,0 +1,1686 @@
+import 'dotenv/config'
+import { Database } from 'bun:sqlite'
+import { type Api, Bot, type Context, GrammyError, InputFile, type Transformer } from 'grammy'
+import type { ApiResponse, InputMediaVideo, Message } from 'grammy/types'
+import { existsSync } from 'node:fs'
+import { chmod, copyFile, mkdir, mkdtemp, readdir, rename, rm, stat } from 'node:fs/promises'
+import { join } from 'node:path'
+import { egressProxy, proxyFreeEnv } from './egress'
+import { DRAIN, pollWithHandover } from './handover'
+import { type Key, t } from './i18n'
+import { type Promo, promos } from './promo'
+import { scratch } from './scratch'
+
+const env = process.env
+const API = env.BOT_API_URL || 'https://api.telegram.org'
+const LOCAL_YTDLP = join(import.meta.dir, 'bin', 'yt-dlp')
+// Prefer an explicitly configured binary, then one already on PATH, and finally
+// the copy installed by `bun run setup` for hosts whose Bun image has no yt-dlp.
+export const YTDLP_BIN = env.YTDLP_PATH || Bun.which('yt-dlp') || (existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp')
+// A local Bot API server takes uploads up to 2000 MB, the cloud one 50 MB
+const LIMIT = (API.includes('api.telegram.org') ? 50 : 2000) * 1024 * 1024
+const COOKIES = env.COOKIES || '/cookies.txt'
+const DATA = env.DATA_DIR || './data'
+// file:// paths only work with a local Bot API server
+const SCRATCH = scratch(API.includes('api.telegram.org') ? '' : undefined)
+const TMP = SCRATCH.dir
+// Videos downloaded and sent at once (slots), long ones in up to 7 of them by
+// default. With 4 (3 for long ones), the 3 long slots were all busy for
+// 88-96% of a day's busiest 6 hours, and long videos waited up to about 3
+// hours for one (#395). The sites that fill them, adult CDNs at 0.1-1.3 MB/s,
+// are slow per connection (Eporner kept its speed in 5 downloads at once,
+// #298), so more at once get more done.
+const MAX_DOWNLOADS = Number(env.MAX_DOWNLOADS || 8)
+// A minute, in ms, of the download time limits, of how old saved info may
+// get, of how often a download's files are weighed and of the waits between
+// self-update tries (bot.e2e.test.ts shortens it)
+const MINUTE = Number(env.MINUTE_MS) || 60_000
+// how long a stopped yt-dlp run gets before it's over (bot.e2e.test.ts halves it)
+const GRACE = Number(env.GRACE_MS) || 5_000
+// Only formats whose every request goes through the proxy: yt-dlp's own HTTP
+// (HLS, DASH, websockets) and ffmpeg's http(s), which yt-dlp hands the proxy
+// to. rtmp, rtsp and mms would connect directly.
+const PROTOCOLS = `[protocol~='^(https?|m3u8(_native)?|http_dash_segments(_generator)?|f4m|ism|websocket_frag)$']`
+// ffmpeg's http input lets a response turn into rtp/udp/rtsp (an SDP or a
+// playlist pointing there), which would skip the proxy: keep it to these.
+// Local files (merger, thumbnail) already default to file,crypto,data.
+const FFMPEG_PROTOCOLS = 'http,https,tls,tcp,httpproxy,crypto,data'
+// tcp and tls stay listed for http(s), but some demuxers (IMF, from an XML
+// response) open such URLs on their own, direct: only HLS and its segments
+const FFMPEG_FORMATS = 'hls,mpegts,mov,matroska,aac,mp3,flv,ac3,eac3,webvtt'
+
+export const YTDLP = [
+  '--no-playlist',
+  '--playlist-items', '1',
+  '--no-warnings',
+  '--js-runtimes', 'bun',
+  '-f', `bv*${PROTOCOLS}+ba${PROTOCOLS}/b${PROTOCOLS}`,
+  '--downloader-args',
+  `ffmpeg_i:-protocol_whitelist ${FFMPEG_PROTOCOLS} -format_whitelist ${FFMPEG_FORMATS}`,
+  // h264/aac plays inline on every Telegram client
+  '-S', 'vcodec:h264,res:1080,acodec:m4a',
+  '--merge-output-format', 'mp4',
+]
+
+type Kind = 'video' | 'animation' | 'audio' | 'document'
+type File = { kind: Kind; file_id: string; title: string; url: string }
+type Opts = Parameters<Context['api']['sendVideo']>[2] &
+  Parameters<Context['api']['sendAudio']>[2]
+// Where a file goes: a chat, replying to a message there, with a promo line
+// or button if the user's experiment arm has one (promo.ts); sent = the id
+// of the message that carried it; stale = a cached video that went out
+// without a size, being downloaded again to replace it: that message and
+// its file_id; who = the user who asked, whose jobs take turns with everyone
+// else's (limit); uploading = its own job has begun the upload
+type Dest = {
+  chat: number | string
+  reply?: number
+  sent?: number
+  promo?: Promo
+  stale?: { message: number; file_id: string }
+  who?: number
+  uploading?: boolean
+}
+// Guest replies can't upload, so their files go through this chat first
+// (the message is deleted right after, the file_id stays valid)
+const STORAGE = env.STORAGE_CHAT || env.ADMIN_ID
+
+// Thrown with the message to show; null = not a video, stay quiet in groups
+export class Fail extends Error {
+  constructor(public key: Key | null, why = key ?? 'not a video') {
+    super(why)
+  }
+}
+
+// News sites' extractors, which claim plain article URLs (not their video,
+// live and embed pages)
+const NEWS = /^(?!.*(video|live|embed)).*(article|news)|^(bbc|cnn|spiegel|voxmedia|lenta)$/i
+
+// Whether a yt-dlp error means the page has no video rather than a video
+// that failed: the generic extractor on any page (no such site, 403, nothing
+// embedded) or a site saying so. Not getting or not parsing the page only
+// counts from a news extractor (NYT, Spiegel, Vox on an article without
+// media); on a video site it's a real failure. Crashes carry no [extractor]
+// tag, so ies = the extractors that claim the link.
+export function notVideo(why: string, ies: string[] = []) {
+  if (/unsupported url|no video|no media|media blocks|\[generic\]/i.test(why))
+    return true
+  if (!/unable to (download webpage|extract|find)|extractor error has occurred/i.test(why))
+    return false
+  const tag = why.match(/^(?:ERROR: )?\[([^\]]+)\]/)?.[1]
+  const by = tag ? [tag] : ies
+  return by.length > 0 && by.every((ie) => NEWS.test(ie))
+}
+
+// A stream that hasn't started makes yt-dlp -J fail: YouTube's own reasons
+// ("This live event will begin in 5 hours.", "Premieres in 3 hours") and
+// other sites' extractor messages ("This livestream has not yet started").
+// An offline channel ("The channel is not currently live") stays a failure:
+// nothing says a stream is coming.
+const UPCOMING = /live event will begin|: premieres?\b|(stream|event|broadcast|space)\b.* not (yet )?started|not started yet|event will start at|scheduled for/i
+
+// 'upcoming' for a yt-dlp error saying the stream hasn't started, else null
+export const unstarted = (why: string): Key | null =>
+  UPCOMING.test(why) ? 'upcoming' : null
+
+// What to say about a stream yt-dlp can't download yet, or null: live now,
+// or announced and not started. A stream that just ended (post_live) is
+// tried like a video.
+export const unready = (v: any): Key | null =>
+  v.is_live || v.live_status === 'is_live'
+    ? 'live'
+    : v.live_status === 'is_upcoming'
+      ? 'upcoming'
+      : null
+
+// The video in what yt-dlp -J printed, or Fail(null) when there is none
+export function picked(info: any) {
+  // yt-dlp prints null when the page had nothing (a t.me text post)
+  if (!info) throw new Fail(null, 'nothing extracted')
+  // YouTube playlists, channels and feeds (WL, LL, history) would hand out
+  // what the logged-in cookies can see; --no-playlist already reduces
+  // watch?v=…&list=… to the video. Multi-video posts elsewhere stay.
+  if (info._type === 'playlist' && /^youtube/i.test(info.extractor_key))
+    throw new Fail(null, 'youtube playlist')
+  // an article page without media is an empty playlist (BBC, CNN)
+  if (info._type === 'playlist' && !info.entries?.[0])
+    throw new Fail(null, 'empty playlist')
+  return info.entries?.[0] ?? info
+}
+
+// A tweet with only text or pictures: shared everywhere, never worth an answer
+const TWEET_NO_VIDEO = /\[twitter\].*no video could be found/i
+
+// What to tell the chat about a failed link, null = nothing. "Not a video"
+// only gets an answer from whoever asked the bot itself.
+export const answer = (key: Key | null, chat: string, called: boolean, why = '') =>
+  TWEET_NO_VIDEO.test(why) ? null : key ?? (chat === 'private' || called ? 'failed' : null)
+
+// Whether a chat hears that its link waits for a slot, or that a restart
+// dropped it. Groups only do when they asked the bot itself: a burst of links
+// there would become a burst of replies on top of the videos, and Telegram
+// allows a group ~20 messages a minute (a 429 isn't retried).
+export const tellQueued = (chat: string, called: boolean) => chat === 'private' || called
+
+// t.me/s/<channel>/<post> is the channel's web preview, which yt-dlp reads
+// as a list of the latest posts: the post itself is t.me/<channel>/<post>
+const tme = (url: URL) => {
+  if (/^(t|telegram)\.me$/i.test(url.hostname))
+    url.pathname = url.pathname.replace(/^\/s\/([^/]+\/\d+)/, '/$1')
+  return url
+}
+
+export function urls(msg: Message) {
+  const text = msg.text ?? msg.caption ?? ''
+  const found = (msg.entities ?? msg.caption_entities ?? []).flatMap((e) =>
+    e.type === 'url'
+      ? [text.slice(e.offset, e.offset + e.length)]
+      : e.type === 'text_link'
+        ? [e.url]
+        : [],
+  )
+  return [
+    ...new Set(
+      found.flatMap((u) => {
+        try {
+          const url = tme(new URL(/^\w+:\/\//.test(u) ? u : `https://${u}`))
+          return /^https?:$/.test(url.protocol) && isPublic(url.hostname)
+            ? [url.href]
+            : []
+        } catch {
+          return []
+        }
+      }),
+    ),
+  ]
+}
+
+// Called on: by an @mention, or in a guest message
+export const summoned = (msg: Message, username: string, guest = false) =>
+  guest || new RegExp(`@${username}\\b`, 'i').test(msg.text ?? msg.caption ?? '')
+
+// Also the links in the message replied to when the bot is summoned
+export function links(msg: Message, username: string, guest = false) {
+  const reply = summoned(msg, username, guest) ? msg.reply_to_message : undefined
+  return [...new Set([...urls(msg), ...(reply ? urls(reply) : [])])]
+}
+
+// Extractors that claim links without being a site's video extractor: the
+// generic one takes any page, the others only refuse (Spotify, Netflix, …)
+const NOT_SITES = new Set(['generic', 'DRM', 'Piracy', 'Liability'])
+
+// Each link's own-site yt-dlp extractors. Decided from the URLs alone,
+// nothing is fetched: --list-extractors prints each extractor with the URLs
+// it matches below it.
+export async function claims(urls: string[]) {
+  const by = new Map<string, string[]>()
+  if (!urls.length) return by
+  const { out } = await check.run(() => ytdlp(['--list-extractors', '--', ...urls]))
+  let ie = ''
+  for (const line of out.split('\n'))
+    if (!line.startsWith(' ')) ie = line.replace(/ \(CURRENTLY BROKEN\)$/, '')
+    else if (!NOT_SITES.has(ie)) by.set(line.trim(), [...(by.get(line.trim()) ?? []), ie])
+  return by
+}
+
+// The links a site's own extractor claims
+export async function videos(urls: string[]) {
+  const by = await claims(urls)
+  return urls.filter((u) => by.has(u))
+}
+
+// What a message asks to download. In groups a link mentioned in passing
+// (a bare domain, an article) isn't a request: unless the bot is summoned,
+// only links to a site yt-dlp knows count.
+export async function requested(
+  msg: Message,
+  username: string,
+  chat: string,
+  video = videos,
+) {
+  const found = links(msg, username)
+  return chat === 'private' || summoned(msg, username) || !found.length
+    ? found
+    : video(found)
+}
+
+// First line against links into the docker network: no IP literals (the URL
+// parser normalizes 2130706433 and 0x7f.1 to 127.0.0.1), no dotless service
+// names, no local-only TLDs. Redirects and public names that resolve inside
+// are stopped by the egress proxy yt-dlp goes through (egress.ts).
+function isPublic(host: string) {
+  host = host.replace(/\.$/, '') // "name." is the same docker service
+  return (
+    host.includes('.') &&
+    !host.startsWith('[') &&
+    !/^[\d.]+$/.test(host) &&
+    !/\.(localhost|local|internal|lan|home\.arpa)$/i.test(host)
+  )
+}
+
+let proxy: Promise<string> | undefined
+// YouTube blocks the server's own address (#415), so its hosts go out through
+// Cloudflare WARP: WARP_PROXY is the videodownloadbot-warp service's HTTP proxy
+// (host:port, wireproxy from the Dockerfile's warp stage)
+export const YOUTUBE = /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com|googlevideo\.com|ytimg\.com)\.?$/i
+const warp = (host: string) => (env.WARP_PROXY && YOUTUBE.test(host) ? env.WARP_PROXY : undefined)
+// ponytail: in-process daily self-update; pin a version if nightly ever breaks
+// The update swaps the binary out, so a run started meanwhile waits for it
+// (else spawn fails with "Executable not found"); it takes seconds, and a
+// hung one can't hold every download back for long. A run already going may
+// still fail on the swap, as the one-file yt-dlp reads its modules from the
+// binary's path while it imports them: the daily update swaps it while jobs
+// run, and so does a retry after a failed first try (selfUpdate).
+let updating: Promise<unknown> = Promise.resolve()
+// One try at it: yt-dlp's exit code, or null when the time limit's SIGTERM
+// stopped it (PyInstaller's bootloader hands that on to yt-dlp and then dies
+// by it too). Another signal (an OOM kill) gives an exit code like any
+// failure. cmd and limit differ only in tests.
+export const updateOnce = (cmd = [YTDLP_BIN, '--update-to', 'nightly'], limit = 5 * 60_000) => {
+  const p = Bun.spawn(cmd, {
+    env: { ...process.env, ...SCRATCH.env },
+    stdout: 'inherit',
+    timeout: limit,
+    killSignal: 'SIGTERM',
+  })
+  const tried = p.exited.then((code) => (p.signalCode === 'SIGTERM' ? null : code))
+  updating = tried
+  return tried
+}
+
+// The minutes from a failed self-update to its next try. GitHub refuses
+// yt-dlp's version check (HTTP 403 "rate limit exceeded") once the address
+// the bot shares has used up its hourly API limit, which renews within the
+// hour, so the last retry comes just over an hour after the first try (#416).
+const UPDATE_RETRIES = [1, 2, 4, 8, 16, 32]
+
+// Updates yt-dlp to the newest nightly: run() is one try, resolving to
+// yt-dlp's exit code (null when the time limit stopped it). A failed try goes
+// again after each of waits (ms) in turn, until one works, and every failure
+// leaves a log line. After one that ran out of time, only the last (longest)
+// wait's try is left: a try that's running holds yt-dlp runs back (updating;
+// at the start, polling), so that one held them for 5 minutes, and one right
+// after might too. yt-dlp gives up on a server that doesn't answer within
+// 20 s, so it takes a transfer that trickles or a stuck run. first = the
+// first try's result; retries = the whole update, over once a try has worked
+// or none is left. pause is Bun.sleep and log console.error but in tests.
+export function selfUpdate(
+  run: () => Promise<number | null>,
+  waits = UPDATE_RETRIES.map((m) => m * MINUTE),
+  pause: (ms: number) => Promise<unknown> = Bun.sleep,
+  log: (line: string) => void = console.error,
+) {
+  const first = run()
+  const retries = (async () => {
+    let code = await first
+    for (let i = 0; code !== 0; i++) {
+      if (code === null) i = Math.max(i, waits.length - 1)
+      const ms = waits[i]
+      const next = ms === undefined ? 'next try tomorrow' : `retry ${i + 1}/${waits.length} in ${+(ms / 60_000).toFixed(1)} min`
+      log(`yt-dlp update ${code === null ? 'timed out' : `failed (${code})`}, ${next}`)
+      if (ms === undefined) return
+      await pause(ms)
+      code = await run()
+    }
+  })().catch(console.error)
+  return { first, retries }
+}
+
+// yt-dlp ran out of time and was stopped
+export class Timeout extends Error {}
+
+// Runs yt-dlp, stopped after timeout ms or once signal aborts: then a Timeout
+// or the abort's reason is thrown, unless yt-dlp still exits 0 and its output
+// closes within 5 s of the stop
+async function ytdlp(args: string[], timeout = 30 * 60_000, signal?: AbortSignal) {
+  // a failed listen isn't kept: the next download tries again
+  proxy ??= egressProxy(undefined, undefined, warp).catch((e) => {
+    proxy = undefined
+    throw e
+  })
+  await updating
+  const via = await proxy
+  // an abort while it waited (a self-update) won't come again
+  signal?.throwIfAborted()
+  // In a process group of its own: yt-dlp hands m3u8 and some HLS downloads
+  // to ffmpeg, which inherits its pipes and goes on when yt-dlp alone is
+  // stopped, so a stop stops the whole group
+  const p = Bun.spawn([YTDLP_BIN, '--proxy', via, ...args], {
+    env: { ...proxyFreeEnv(), ...SCRATCH.env },
+    stdout: 'pipe',
+    stderr: 'pipe',
+    detached: true,
+  })
+  // the group, or yt-dlp alone if there's no group; none once the run is
+  // over, whatever timer or abort comes late (its number could lead another
+  // group by then)
+  let over = false
+  const kill = (sig: NodeJS.Signals) => {
+    if (over) return
+    try {
+      process.kill(-p.pid, sig)
+    } catch {
+      p.kill(sig)
+    }
+  }
+  // why the run was stopped, the first time: SIGTERM, and GRACE (5 s) later
+  // the run is over, even if something still holds the pipes
+  let stopped: Error | undefined
+  const cutoff = Promise.withResolvers<void>()
+  const timers: ReturnType<typeof setTimeout>[] = []
+  const stop = (why: Error) => {
+    if (stopped) return
+    stopped = why
+    kill('SIGTERM')
+    timers.push(setTimeout(cutoff.resolve, GRACE))
+  }
+  timers.push(
+    setTimeout(
+      () => stop(new Timeout(`yt-dlp timed out after ${+(timeout / 60_000).toFixed(1)} min`)),
+      timeout,
+    ),
+  )
+  const abort = () => stop(signal!.reason)
+  signal?.addEventListener('abort', abort)
+  try {
+    const run = await Promise.race([
+      Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]),
+      cutoff.promise,
+    ])
+    if (!run || (run[2] && stopped)) throw stopped
+    const [out, err, code] = run
+    if (code) throw new Error(err.trim().split('\n').pop() || `yt-dlp ${code}`)
+    return { out, err }
+  } finally {
+    // Then whatever is left of a stopped run's group gets SIGKILL, whether
+    // it holds the pipes or not (a merge's ffmpeg doesn't). While anything is
+    // left no other group can have the number, and since pids are handed out
+    // in turn, neither can one just after the last of it is gone
+    if (stopped) kill('SIGKILL')
+    over = true
+    signal?.removeEventListener('abort', abort)
+    for (const t of timers) clearTimeout(t)
+  }
+}
+
+type Size = { width: number; height: number }
+
+// The size a player shows a video stream at (ffprobe's stream entry): the
+// coded size stretched by the sample aspect ratio, turned by the rotation
+export function shown(s: any): Size | undefined {
+  if (!(s?.width > 0 && s?.height > 0)) return
+  // "0:1" or "N/A" = unknown, square pixels
+  const [n, d] = String(s.sample_aspect_ratio).split(':').map(Number)
+  const width = n > 0 && d > 0 ? Math.round((s.width * n) / d) : s.width
+  const rotation = Number(
+    s.side_data_list?.find((x: any) => x.rotation !== undefined)?.rotation ??
+      s.tags?.rotate ??
+      0,
+  )
+  return Math.abs(rotation) % 180 === 90
+    ? { width: s.height, height: width }
+    : { width, height: s.height }
+}
+
+// Telegram draws the player box from sendVideo's width/height and ignores the
+// file's pixel aspect: they come from the file itself, since yt-dlp often has
+// none (Instagram's progressive mp4s) or another format's
+export async function probe(path: string) {
+  const p = Bun.spawn(
+    [
+      'ffprobe', '-v', 'error', '-select_streams', 'V:0',
+      '-show_entries', 'stream=width,height,sample_aspect_ratio:stream_side_data=rotation:stream_tags=rotate',
+      '-of', 'json', path,
+    ],
+    { stdout: 'pipe', stderr: 'ignore' },
+  )
+  const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited])
+  if (code) return
+  try {
+    return shown(JSON.parse(out).streams?.[0])
+  } catch {
+    return
+  }
+}
+
+// The thumbnail's filter: square pixels first (ffmpeg has already applied
+// the rotation), then within 320x320
+export const THUMB = "scale='iw*sar':ih,scale=320:320:force_original_aspect_ratio=decrease"
+
+// A new file rather than a cached file_id (a local file:// path is new too)
+export const fresh = (f: string | InputFile) =>
+  typeof f !== 'string' || f.startsWith('file:')
+
+// Runs at most max fns at once, long ones at most maxLong of them, the rest
+// wait their turn. who = whose fn (a user): one user's fns get at most
+// max - 1 turns, and long ones maxLong - 1 (all of them when there's only
+// one), so a burst of one user's links always leaves someone else a turn; a
+// free turn goes to the first in line among those with the fewest running
+// whose fn fits. Fns without a who share no such limit. A fn in line holds
+// nothing.
+export function limit(max: number, maxLong = max) {
+  let running = 0
+  let long = 0
+  // each user's running fns: all of them and the long ones
+  const per = new Map<unknown, { all: number; long: number }>()
+  const mine = (who: unknown) => per.get(who) ?? { all: 0, long: 0 }
+  const add = (who: unknown, isLong: boolean, n: number) => {
+    running += n
+    if (isLong) long += n
+    const m = mine(who)
+    const now = { all: m.all + n, long: m.long + (isLong ? n : 0) }
+    if (now.all) per.set(who, now)
+    else per.delete(who)
+  }
+  // one user's part of n turns
+  const share = (n: number) => Math.max(1, n - 1)
+  const fits = (who: unknown, isLong: boolean) => {
+    const m = mine(who)
+    return (
+      running < max &&
+      !(isLong && long >= maxLong) &&
+      (who === undefined || (m.all < share(max) && !(isLong && m.long >= share(maxLong))))
+    )
+  }
+  // Nothing in line fits: ended turns go to the ones that do (one ending can
+  // let in two: one its user's part held back, and one more), so a new fn
+  // that fits jumps nobody who could run
+  const queue: { who: unknown; long: boolean; go: () => void; stop: (e: Error) => void }[] = []
+  let closed: Error | undefined
+  // Waits for a turn; the returned fn ends it
+  const take = async (who?: unknown, isLong = false) => {
+    if (closed && (isLong || !fits(who, isLong))) throw closed
+    if (fits(who, isLong)) add(who, isLong, 1)
+    else await new Promise<void>((go, stop) => queue.push({ who, long: isLong, go, stop })) // counted in by whoever hands over
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      add(who, isLong, -1)
+      for (;;) {
+        let next = -1
+        queue.forEach((w, i) => {
+          if (fits(w.who, w.long) && (next < 0 || mine(w.who).all < mine(queue[next]!.who).all))
+            next = i
+        })
+        if (next < 0) return
+        const w = queue.splice(next, 1)[0]!
+        add(w.who, w.long, 1)
+        w.go()
+      }
+    }
+  }
+  return {
+    take,
+    async run<T>(fn: () => Promise<T>, who?: unknown) {
+      const done = await take(who)
+      try {
+        return await fn()
+      } finally {
+        done()
+      }
+    },
+    // whether a new fn of who's would have to wait (once closed, it fails or
+    // starts at once)
+    busy: (isLong = false, who?: unknown) => !closed && !fits(who, isLong),
+    // the fns in line when a new one asks, other users' that wait only for
+    // their own part included: long ones only count for a short one while
+    // they could have a turn
+    waiting: (isLong = false) =>
+      queue.filter((w) => isLong || !w.long || long < maxLong).length,
+    // How many of who's fns, long or short, have a turn or wait in line for
+    // one: with none, a new fn of theirs that has to wait waits for other
+    // users' fns alone. Fns without a who share no part and count none.
+    own: (who: unknown) =>
+      who === undefined ? 0 : mine(who).all + queue.filter((w) => w.who === who).length,
+    // Fails the fns still waiting with e, and later ones that would have to
+    // wait or are long (a restart has time for a short one); running ones go on
+    close(e: Error) {
+      closed = e
+      for (const w of queue.splice(0)) w.stop(e)
+    },
+  }
+}
+
+// What yt-dlp says the formats it picked weigh (video and audio, or the one),
+// undefined for one it doesn't say
+type Weighed = { filesize?: number | null; filesize_approx?: number | null }
+export const sizes = (v: Weighed & { requested_formats?: Weighed[] }) =>
+  (v.requested_formats ?? [v]).map((f) => f.filesize || f.filesize_approx || undefined)
+
+// Long videos: over 10 minutes. One that doesn't say how long it is counts as
+// long too (an HLS/DASH stream or a file of unknown length can take 20-40
+// minutes), unless it's from Instagram or an X post, whose reels and GIFs
+// usually don't say and come in seconds, or yt-dlp says what all of it weighs
+// and that's 100 MB at most (typically under 2 minutes). X is the Twitter key
+// alone: TwitterBroadcast and TwitterSpaces are long HLS replays.
+export const LONG = 10 * 60
+export const SMALL = 100 * 2 ** 20
+const QUICK = /^(Instagram\w*|Twitter)$/
+export const isLong = (
+  v: Parameters<typeof sizes>[0] & { duration?: number | null; extractor_key?: string },
+) => {
+  if (v.duration && v.duration > 0) return v.duration > LONG
+  if (QUICK.test(v.extractor_key ?? '')) return false
+  const s = sizes(v)
+  return s.includes(undefined) || s.reduce<number>((all, n) => all + n!, 0) > SMALL
+}
+
+// The minutes a job may spend downloading: 45 for a long video, else 30. Some
+// sites (adult CDNs) serve one connection at about 1-1.3 MB/s, where the
+// biggest file a local Bot API takes (2000 MB) can need about 35 minutes, and
+// a flat 30 cut off about 8 downloads a day, mostly from such sites (#298).
+// With two or more slots long videos leave short ones a slot, so the longer
+// limit mostly holds up other long ones.
+export const downloadMinutes = (long: boolean) => (long ? 45 : 30)
+
+// yt-dlp's saved info over a minute old: its media links may have expired
+// while the job waited its turn
+export const stale = (age: number) => age > MINUTE
+// Whether a download from stale saved info that failed gets another try that
+// reads the page again, in the time the job has left: when over a minute is
+// (none is, after a timeout)
+export const reread = (age: number, left: number) => stale(age) && left > MINUTE
+
+// Whether the page read again picks the file(s) the failed try got part of.
+// yt-dlp's --continue goes on from whatever file has the name it's about to
+// write, a .part by its bytes (an HTTP Range request) and a .ytdl by its
+// fragment index, without asking which format that came from, and one
+// format's name is the extension alone (v.mp4.part): another format's bytes
+// or fragments would be appended to the first one's. The same pick is of the
+// same video (a multi-video post's first one may change) and has formats with
+// the same ids and encodings: yt-dlp numbers the formats a site gives no id
+// of their own (0, 1, … in its order, hls-N), so an id alone could name
+// another file. Each format also has the same exact size, or where yt-dlp
+// doesn't know it, the same link. On a site yt-dlp has an extractor for,
+// that's up to the query, where signatures that change with every read
+// usually go: the video's id is the site's, and its format ids and encodings
+// tell its files apart. A page it reads with its generic extractor (GENERIC)
+// is another matter: the id comes from the page's address, and a <video>
+// there has a format with nothing but its index, ext and protocol, so its
+// whole link is all that tells another clip apart, the query too (a page may
+// pick its clip by it: /stream?clip=…). A link whose host or path changes
+// between the reads (a CDN that answers from another server, a signature in
+// the path), or on a generic page its query, starts over: safe, but slower.
+// A link that stays the same while the file behind it changes can't be told.
+const ENCODING = ['format_id', 'ext', 'protocol', 'width', 'height', 'tbr', 'vcodec', 'acodec']
+// yt-dlp's generic extractor and the embeds it finds on pages, whose video id
+// isn't a site's own: it's the page's (the HTML5 and quoted-HTML ones, by
+// _generic_id), the file's name without its extension and query (WordPress
+// players, Camtasia) or a page widget's (Elementor), and their formats may
+// have nothing but a link (yt-dlp 2026.08.19)
+const GENERIC =
+  /^(Generic|HTML5MediaEmbed|QuotedHTML|ElementorEmbed|WordpressPlaylistEmbed|WordpressMiniAudioPlayerEmbed|CamtasiaEmbed)$/
+// a link without its #fragment, and its query unless whole
+const link = (url: unknown, whole: boolean) =>
+  typeof url === 'string' ? url.split(whole ? '#' : /[?#]/)[0] : null
+const files = (v: any) => {
+  const whole = GENERIC.test(v.extractor_key)
+  return [
+    v.extractor_key,
+    v.id,
+    (v.requested_formats ?? [v]).map((f: any) => [
+      ...ENCODING.map((k) => f[k] ?? null),
+      f.filesize || link(f.url, whole),
+    ]),
+  ]
+}
+// Whether yt-dlp downloads a pick from its saved info: a video, not a
+// playlist (one a multi-video post's -J may have as its first entry)
+const isVideo = (v: any) => (v._type ?? 'video') === 'video'
+// What a download from saved info gets: the video picked, alone. yt-dlp loads
+// saved info without its entries (--clean-info-json), so from a multi-video
+// post's -J (a playlist of its first video, --playlist-items 1) it would have
+// nothing to download but the page, which it reads again itself and goes on
+// in, --continue, from whatever that picks. A pick that's a playlist goes as
+// -J printed it (json): its page is read again either way.
+export const saved = (v: any, json: string) => (isVideo(v) ? JSON.stringify(v) : json)
+// so the same pick is a video, judged as it's downloaded
+export const samePick = (a: any, b: any) =>
+  isVideo(a) && isVideo(b) && JSON.stringify(files(a)) === JSON.stringify(files(b))
+
+// The key a video's file is cached under, whatever link led to it
+const cacheKey = (v: any) => `${v.extractor_key}:${v.id}`
+
+// The slots for downloading and sending videos. Long ones (20-40 min each on
+// some sites) take at most MAX_DOWNLOADS - 1 of them (with one slot, that
+// one), so long downloads never hold every slot; one user's get one fewer
+// when there are more (limit), so another user's long video doesn't wait for
+// theirs either. The whole download and upload holds a slot:
+// a link flood can't fork unbounded yt-dlp runs or pile finished files up in
+// TMP while uploads crawl
+const slots = limit(MAX_DOWNLOADS, Math.max(1, MAX_DOWNLOADS - 1))
+// yt-dlp -J, which tells a job's lane, runs before it takes a slot
+const meta = limit(MAX_DOWNLOADS)
+// group links are checked one yt-dlp run per message: a flood of them
+// queues instead of forking a process each
+const check = limit(2)
+
+// The signal of a progress message, which isn't worth a flood wait. grammY's
+// Node typings have an AbortSignal of their own, which a real one fits.
+type Signal = NonNullable<Parameters<Api['sendMessage']>[3]>
+export const PROGRESS = new AbortController().signal as unknown as Signal
+
+// Telegram's flood control: a 429 says how many seconds until the chat takes
+// messages again (parameters.retry_after, 3-40 s in busy groups). The request
+// waits that long and goes again, up to retries times and max seconds in all,
+// so a burst of links in a group delays the videos instead of losing them.
+// Every 429 starts or extends the chat's flood, the one that ends a request's
+// retries too. While the chat is in a flood, its requests line up and go one
+// at a time: let through together, all but one would hit the limit again and
+// use up their retries. Each has the turn through its own retries and passes
+// it on when it's done, or once it's been gap seconds in flight: an upload
+// can take minutes, and the chat's other requests (and their download slots)
+// mustn't wait for it. A PROGRESS request's 429 comes back at once, and the
+// chat's line still waits the flood out. getUpdates has grammY's own wait,
+// and a chat action would be stale by then. flooded(chat) = whether the chat
+// is in a flood or has a line.
+export function floodWait(retries = 5, max = 120, gap = 1) {
+  // chats in a flood: until when, the end of its line, and the requests in it
+  type Flood = { until: number; last: Promise<void>; size: number }
+  const floods = new Map<string | symbol, Flood>()
+  const over = (f: Flood) => f.until <= Date.now() && !f.size
+  const forget = (chat: string | symbol, f: Flood) => {
+    if (floods.get(chat) === f && over(f)) floods.delete(chat)
+  }
+  // the chat's flood lasts s seconds more at least
+  const hold = (chat: string | symbol, s: number) => {
+    const f = floods.get(chat) ?? { until: 0, last: Promise.resolve(), size: 0 }
+    f.until = Math.max(f.until, Date.now() + s * 1000)
+    floods.set(chat, f)
+    void Bun.sleep(f.until - Date.now()).then(() => forget(chat, f))
+  }
+  // waits for a turn in the chat's line; returns what passes it on
+  const line = async (chat: string | symbol, f: Flood) => {
+    const ahead = f.last
+    let next = () => {}
+    f.last = new Promise<void>((go) => (next = go))
+    f.size++
+    await ahead
+    return () => {
+      f.size--
+      next()
+      forget(chat, f)
+    }
+  }
+  const wait: Transformer = async (prev, method, payload, signal) => {
+    if (method === 'getUpdates' || method === 'sendChatAction')
+      return prev(method, payload, signal)
+    const id = (payload as { chat_id?: number | string } | undefined)?.chat_id
+    // a request without a chat (to an inline message) waits on its own
+    const chat = id === undefined ? Symbol() : String(id)
+    // the seconds a 429 asks to wait, unless it's longer than max
+    const after = (res: ApiResponse<unknown>) => {
+      const s = res.ok || res.error_code !== 429 ? undefined : res.parameters?.retry_after
+      return s === undefined || s > max ? undefined : s
+    }
+    if (signal === PROGRESS) {
+      const res = await prev(method, payload, signal)
+      const s = after(res)
+      if (s !== undefined) hold(chat, s)
+      return res
+    }
+    let tries = 0
+    let waited = 0
+    // passes the chat's turn on, while this request has it
+    let pass: (() => void) | undefined
+    try {
+      for (;;) {
+        const f = floods.get(chat)
+        if (f && !over(f)) {
+          pass ??= await line(chat, f)
+          // another 429 may push the wait out while this one sleeps
+          while (f.until > Date.now()) await Bun.sleep(f.until - Date.now())
+        }
+        const mine = pass
+        const slow = mine
+          ? setTimeout(() => {
+              if (pass !== mine) return
+              pass = undefined
+              mine()
+            }, gap * 1000)
+          : undefined
+        const res = await prev(method, payload, signal).finally(() => clearTimeout(slow))
+        const s = after(res)
+        if (s !== undefined) hold(chat, s)
+        if (s === undefined || (waited += s) > max || ++tries > retries) return res
+        console.error('flood', method, `retry after ${s}`, `${tries}/${retries}`)
+      }
+    } finally {
+      pass?.()
+    }
+  }
+  return Object.assign(wait, {
+    flooded: (chat: number | string) => {
+      const f = floods.get(String(chat))
+      return !!f && !over(f)
+    },
+  })
+}
+
+// A progress status isn't worth a flood wait: waiting it out would hold the
+// job's download slot and use up the chat's messages ahead of the video. It's
+// skipped while the chat is in a flood, and a 429 on it only starts one.
+// show(signal) shows it.
+export async function progress(flooded: boolean, show: (signal: Signal) => Promise<unknown>) {
+  if (flooded) return
+  await show(PROGRESS).catch((e) => {
+    if (!(e instanceof GrammyError && e.error_code === 429)) throw e
+  })
+}
+
+// Deletes a message the bot sent to STORAGE (a guest upload sits in the
+// admin's DM until then): through a flood wait floodWait gives up on (over
+// its max) and network or server errors, tries times in all. What it still
+// can't delete is logged, not thrown. pause is Bun.sleep but in tests.
+export async function unsend(
+  del: () => Promise<unknown>,
+  tries = 6,
+  pause: (ms: number) => Promise<unknown> = Bun.sleep,
+) {
+  for (let i = 1; ; i++) {
+    try {
+      return void (await del())
+    } catch (e) {
+      const g = e instanceof GrammyError ? e : undefined
+      if ((g && g.error_code !== 429 && g.error_code < 500) || i >= tries)
+        return console.error('delete failed', (e as Error).message)
+      console.error('delete retry', i, (e as Error).message)
+      await pause((g?.parameters.retry_after ?? 5 * 2 ** i) * 1000)
+    }
+  }
+}
+
+// Sends a file to dest.chat as kind; returns the kind it went as, its file_id
+// and the message
+export const sender = (api: Api) =>
+  async function send(
+    dest: Dest,
+    kind: Kind,
+    file: () => string | InputFile,
+    opts: Opts,
+  ): Promise<[Kind, string, Message]> {
+    const { chat } = dest
+    let m: Message
+    try {
+      m =
+        kind === 'video'
+          ? await api.sendVideo(chat, file(), opts)
+          : kind === 'animation'
+            ? await api.sendAnimation(chat, file(), opts)
+            : kind === 'audio'
+              ? await api.sendAudio(chat, file(), opts)
+              : await api.sendDocument(chat, file(), opts)
+    } catch (e) {
+      // a fresh file Telegram won't take as media still goes as a file; a
+      // cached file_id doesn't (a local file:// path is fresh). A 429 is no
+      // reason to: it's about the chat, not the file, and floodWait has
+      // already waited it out as long as it should.
+      if (
+        kind === 'document' ||
+        !fresh(file()) ||
+        (e instanceof GrammyError && e.error_code === 429)
+      )
+        throw e
+      m = await api.sendDocument(chat, file(), opts)
+    }
+    const media = m.video ?? m.animation ?? m.audio ?? m.document
+    dest.sent = m.message_id
+    if (!media) throw new Error('no file in sent message')
+    const sent = m.video
+      ? 'video'
+      : m.animation
+        ? 'animation'
+        : m.audio
+          ? 'audio'
+          : 'document'
+    return [sent, media.file_id, m]
+  }
+
+// The live cookie jar sits on the data volume, so the session cookies Google
+// rotates survive restarts. COOKIES only seeds it, again whenever it changes.
+const JAR = join(DATA, 'cookies.txt')
+const SEED = join(DATA, 'cookies.seed.txt')
+
+async function seedJar() {
+  if (!existsSync(COOKIES)) return
+  const seed = await Bun.file(COOKIES).text()
+  if (existsSync(SEED) && (await Bun.file(SEED).text()) === seed) return
+  await Bun.write(JAR, seed)
+  await Bun.write(SEED, seed)
+}
+
+// yt-dlp gets a private copy (parallel runs would clobber one file)...
+const taken = new Map<string, number>()
+async function jar(dir: string) {
+  if (!existsSync(JAR)) return []
+  taken.set(dir, (await stat(JAR)).mtimeMs)
+  await copyFile(JAR, join(dir, 'cookies.txt'))
+  // the job folder may be readable by the Bot API server (scratch.ts), the session isn't
+  await chmod(join(dir, 'cookies.txt'), 0o600)
+  return ['--cookies', join(dir, 'cookies.txt')]
+}
+
+// ...and its refreshed cookies go back, unless YouTube dropped the login or
+// another run saved newer ones meanwhile
+async function saveJar(dir: string) {
+  const since = taken.get(dir)
+  taken.delete(dir)
+  const copy = join(dir, 'cookies.txt')
+  if (!existsSync(copy) || !(await Bun.file(copy).text()).includes('\tLOGIN_INFO\t'))
+    return
+  if (since !== undefined && (await stat(JAR)).mtimeMs !== since) return
+  await copyFile(copy, `${JAR}.new`)
+  await rename(`${JAR}.new`, JAR)
+}
+
+// First-seen chat and user ids, for stats.borodutch.com (served on STATS_PORT
+// inside the Docker network only, no domain): totals and new ones per UTC day,
+// plus the audience: chats by type and by days since their last update, and
+// private chats that blocked the bot (counts only, never ids)
+export const WINDOWS = [7, 30, 90, 180] as const
+export function census(db: Database) {
+  const tables = ['chats', 'users'] as const
+  for (const t of tables)
+    db.run(`CREATE TABLE IF NOT EXISTS ${t} (id INTEGER PRIMARY KEY, created INTEGER NOT NULL)`)
+  for (const col of ['seen INTEGER', 'type TEXT', 'gone INTEGER NOT NULL DEFAULT 0'])
+    try {
+      db.run(`ALTER TABLE chats ADD COLUMN ${col}`)
+    } catch {} // already there
+  const chat = db.query(
+    `INSERT INTO chats (id, created, seen, type) VALUES (?1, unixepoch(), unixepoch(), ?2)
+     ON CONFLICT (id) DO UPDATE SET seen = excluded.seen, type = coalesce(excluded.type, type), gone = 0`,
+  )
+  const user = db.query('INSERT OR IGNORE INTO users VALUES (?, unixepoch())')
+  const member = db.query(
+    `INSERT INTO chats (id, created, type, gone) VALUES (?1, unixepoch(), 'private', ?2)
+     ON CONFLICT (id) DO UPDATE SET gone = excluded.gone`,
+  )
+  const daily = (t: string) =>
+    db
+      .query(`SELECT date(created, 'unixepoch') AS date, count(*) AS count FROM ${t} GROUP BY 1 ORDER BY 1`)
+      .all() as { date: string; count: number }[]
+  const total = (t: string) =>
+    (db.query(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n
+  const recent = WINDOWS.map(
+    (d) => `sum(gone = 0 AND unixepoch() - coalesce(seen, created) < ${d * 86400}) AS d${d}`,
+  ).join(', ')
+  const audience = () =>
+    Object.fromEntries(
+      (
+        db
+          .query(
+            `SELECT coalesce(type, CASE WHEN id > 0 THEN 'private' WHEN id < -1000000000000
+               THEN 'supergroup_or_channel' ELSE 'group' END) AS kind,
+             count(*) AS ever, sum(gone) AS unreachable, ${recent}
+             FROM chats GROUP BY 1`,
+          )
+          .all() as ({ kind: string } & Record<string, number>)[]
+      ).map(({ kind, ...n }) => [kind, n]),
+    )
+  return {
+    // a chat's last activity: any update from it except the bot's own membership changes
+    seen(chatId?: number, userId?: number, type?: string) {
+      if (chatId !== undefined) chat.run(chatId, type ?? null)
+      if (userId !== undefined) user.run(userId)
+    },
+    // a private chat blocked (kicked) or unblocked the bot
+    member(chatId: number, status: string) {
+      member.run(chatId, status === 'kicked' ? 1 : 0)
+    },
+    stats: () => ({
+      chatCount: total('chats'),
+      userCount: total('users'),
+      chatDaily: daily('chats'),
+      userDaily: daily('users'),
+      audience: audience(),
+    }),
+  }
+}
+
+const esc = (s: string) =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+// Seconds since t, for the job log
+const elapsed = (t: number) => ((Date.now() - t) / 1000).toFixed(1)
+
+// The media in a job's dir, downloaded so far or done (yt-dlp names it all
+// v.*): each file's name and bytes
+async function media(dir: string) {
+  const files: { name: string; bytes: number }[] = []
+  for (const name of await readdir(dir).catch(() => []))
+    if (name.startsWith('v.'))
+      files.push({ name, bytes: (await stat(join(dir, name)).catch(() => undefined))?.size ?? 0 })
+  return files
+}
+
+// MB of media in a job's dir, not counting the v.temp.* a merge or fixup
+// writes from the rest
+export async function onDisk(dir: string) {
+  let bytes = 0
+  for (const f of await media(dir)) if (!f.name.startsWith('v.temp.')) bytes += f.bytes
+  return Math.round(bytes / 2 ** 20)
+}
+
+// Bytes of the biggest media file in a job's dir, a merge's or fixup's
+// v.temp.* too (it becomes the video)
+export const biggest = async (dir: string) =>
+  (await media(dir)).reduce((max, f) => Math.max(max, f.bytes), 0)
+
+// Deletes the media in a job's dir: whatever a failed download left
+export async function drop(dir: string) {
+  for (const f of await media(dir)) await rm(join(dir, f.name), { recursive: true, force: true })
+}
+
+// How a job that threw e ends in the job log: fail:<what the chat was told>,
+// timeout (the download ran out of time) or error
+export const outcome = (e: unknown) =>
+  e instanceof Fail ? `fail:${e.key ?? 'quiet'}` : e instanceof Timeout ? 'timeout' : 'error'
+
+function main() {
+  const db = new Database(join(DATA, 'bot.sqlite'), { create: true })
+  db.run(
+    'CREATE TABLE IF NOT EXISTS files (key TEXT PRIMARY KEY, kind TEXT NOT NULL, file_id TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL)',
+  )
+  const get = db.query<File, [string]>('SELECT * FROM files WHERE key = ?')
+  const put = (key: string, f: File) =>
+    db
+      .query('INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)')
+      .run(key, f.kind, f.file_id, f.title, f.url)
+  // file_ids uploaded with the file's own size (#281), or whose one refresh
+  // was tried; older videos may have gone out without a size. A table of its
+  // own: a container still running the old code keeps writing files.
+  db.run('CREATE TABLE IF NOT EXISTS sized (file_id TEXT PRIMARY KEY)')
+  // true the first time only
+  const settle = (fileId: string) =>
+    db.query('INSERT OR IGNORE INTO sized VALUES (?)').run(fileId).changes > 0
+  // every link cached with the old file gets the new one
+  const swap = (old: string, f: File) =>
+    db.query('UPDATE files SET kind = ?, file_id = ? WHERE file_id = ?').run(f.kind, f.file_id, old)
+  const forget = (f: File) =>
+    db.query('DELETE FROM files WHERE file_id = ?').run(f.file_id)
+  const people = census(db)
+  Bun.serve({
+    port: Number(env.STATS_PORT || 8080),
+    fetch: (req) =>
+      new URL(req.url).pathname === '/stats'
+        ? Response.json(people.stats())
+        : new Response('Not found', { status: 404 }),
+  })
+
+  const promo = promos(db)
+  const bot = new Bot(env.TOKEN!, {
+    client: { apiRoot: API, timeoutSeconds: 3600 },
+  })
+  // every request, ctx.api's too (grammY copies the bot's transformers)
+  const flood = floodWait()
+  bot.api.config.use(flood)
+  const jobs = new Map<string, Promise<File>>()
+  // The other requests for a link whose job runs follow its statuses: tell =
+  // each one's, key = the job's last
+  const watching = new Map<string, { key?: Key; tell: Set<(key: Key) => void> }>()
+  // The requests running now, each with a way to tell its chat that the exit
+  // cuts it off
+  const open = new Set<() => void>()
+  // Set by the exit's cut: from then on no job begins an upload (job())
+  let exiting = false
+  // Handlers run detached; counted so a deploy lets the running ones finish
+  let running = 0
+  const track = (p: Promise<unknown>) => {
+    running++
+    return p.finally(() => running--)
+  }
+  // The help text goes out detached too: in a flood wait a reply can take
+  // minutes, and updates are handled one at a time
+  const help = (ctx: Context) =>
+    void track(ctx.reply(t(ctx.from?.language_code, 'help')).catch(console.error))
+
+  const send = sender(bot.api)
+
+  const options = (dest: Dest, f: Pick<File, 'title' | 'url'>): Opts => ({
+    caption:
+      `<a href="${esc(f.url)}">${esc([...f.title].slice(0, 200).join(''))}</a>\n@${bot.botInfo.username}` +
+      (dest.promo?.format === 'caption'
+        ? `\n\n<a href="${esc(dest.promo.url)}">${esc(dest.promo.text)}</a>`
+        : ''),
+    reply_markup:
+      dest.promo?.format === 'button'
+        ? { inline_keyboard: [[{ text: dest.promo.text, url: dest.promo.url }]] }
+        : undefined,
+    parse_mode: 'HTML',
+    supports_streaming: true,
+    disable_notification: !dest.reply,
+    reply_parameters: dest.reply
+      ? { message_id: dest.reply, allow_sending_without_reply: true }
+      : undefined,
+  })
+
+  // false = the cached file_id is dead, download again; other errors (flood
+  // wait, blocked bot, no media rights) keep the cache and propagate. A video
+  // cached before #281 that Telegram has without a size (it shows squeezed)
+  // goes to unsized with its message, once per file_id.
+  async function resend(dest: Dest, f: File, unsized?: (id: number) => void) {
+    try {
+      const [, , m] = await send(dest, f.kind, () => f.file_id, options(dest, f))
+      if (unsized && m.video && !(m.video.width && m.video.height) && settle(f.file_id))
+        unsized(m.message_id)
+      return true
+    } catch (e) {
+      if (!(e instanceof GrammyError && e.error_code === 400 && /file/i.test(e.description)))
+        throw e
+      console.error('resend', f.url, e.description)
+      forget(f)
+      return false
+    }
+  }
+
+  async function download(
+    dest: Dest,
+    url: string,
+    status: (key: Key) => Promise<void>,
+  ): Promise<File> {
+    if (dest.reply)
+      void bot.api.sendChatAction(dest.chat, 'upload_video').catch(() => {})
+    // One line per job, for where the time goes (in seconds): the wait for a
+    // yt-dlp -J turn and the run, the wait for a slot, how many jobs were
+    // in line and how many of the user's own had a slot or were in line
+    // (with none, a wait was behind other people's links alone), the
+    // download (a failed one too, with the MB it got), and probe, thumbnail
+    // and upload together
+    const log: Record<string, string | number> = { host: new URL(url).hostname }
+    const start = Date.now()
+    let result = 'ok'
+    try {
+      const f = await job(dest, url, status, log)
+      // only an upload times it
+      if (!log.up) result = 'cached'
+      return f
+    } catch (e) {
+      result = outcome(e)
+      throw e
+    } finally {
+      log.total = elapsed(start)
+      console.log('job', result, Object.entries(log).map(([k, v]) => `${k}=${v}`).join(' '))
+    }
+  }
+
+  async function job(
+    dest: Dest,
+    url: string,
+    status: (key: Key) => Promise<void>,
+    log: Record<string, string | number>,
+  ): Promise<File> {
+    const dir = await mkdtemp(join(TMP, 'job-'))
+    let free = () => {}
+    // a link that has to wait for a -J turn or a slot would otherwise look
+    // ignored: it hears it's queued, once
+    let queued = false
+    const wait = async (busy: boolean) => {
+      if (!busy || queued) return
+      queued = true
+      await status('queued').catch(() => {})
+    }
+    try {
+      await SCRATCH.open(dir)
+      let args = [...YTDLP, ...(await jar(dir))]
+      let json: string
+      const asked = Date.now()
+      await wait(meta.busy(false, dest.who))
+      try {
+        json = (
+          await meta.run(async () => {
+            log.metaq = elapsed(asked)
+            const t = Date.now()
+            try {
+              return await ytdlp([...args, '-J', url], 5 * 60_000)
+            } finally {
+              log.meta = elapsed(t)
+            }
+          }, dest.who)
+        ).out
+      } catch (e) {
+        // a restart (meta.close) isn't the link's fault
+        if (e instanceof Fail) throw e
+        const why = String((e as Error).message)
+        const soon = unstarted(why)
+        if (soon) throw new Fail(soon, why)
+        // an untagged error needs the extractors that claim the link
+        const ies = /^(ERROR: )?\[/.test(why)
+          ? []
+          : ((await claims([url]).catch(() => undefined))?.get(url) ?? [])
+        throw new Fail(notVideo(why, ies) ? null : 'failed', why)
+      }
+      const extracted = Date.now()
+      // The video and the key it's cached under: the page read again may
+      // pick another one (again())
+      let v = picked(JSON.parse(json))
+      let id = cacheKey(v)
+      // The video may be cached under another link, or get cached by another
+      // job while this one waits; a refresh wants a new upload, not another
+      // cached copy
+      const fromCache = async (key: string) => {
+        const hit = get.get(key)
+        if (hit && !dest.stale && (await resend(dest, hit))) {
+          put(url, hit)
+          return hit
+        }
+      }
+      // What a video the page picks goes through before it's downloaded: a
+      // stream yt-dlp can't download yet fails, a refresh stops quietly
+      // unless it's the video it replaces, a copy cached under its key goes
+      // out and is returned, and one yt-dlp says is too big fails. A
+      // refresh's download takes the old copy's place in the chat and under
+      // every key cached with it (swap), so it has to be the video whose key
+      // has that copy: the page may lead to another one now, at the first
+      // read or when read again (a multi-video post whose first one has
+      // changed), and the old copy stays.
+      const vet = async (pick: any) => {
+        const stream = unready(pick)
+        if (stream) throw new Fail(stream, `${stream} stream`)
+        if (dest.stale && get.get(cacheKey(pick))?.file_id !== dest.stale.file_id)
+          throw new Fail(null, 'another video')
+        const hit = await fromCache(cacheKey(pick))
+        if (hit) return hit
+        const size = sizes(pick).reduce<number>((all, n) => all + (n ?? 0), 0)
+        if (size > LIMIT) throw new Fail('tooBig')
+      }
+      const hit = await vet(v)
+      if (hit) return hit
+
+      const long = isLong(v)
+      log.lane = long ? 'long' : 'short'
+      log.ahead = slots.waiting(long)
+      log.own = slots.own(dest.who)
+      log.dur = v.duration ? Math.round(v.duration) : '?'
+      await wait(slots.busy(long, dest.who))
+      const waited = Date.now()
+      free = await slots.take(dest.who, long)
+      log.wait = elapsed(waited)
+      const sent = await fromCache(id)
+      if (sent) return sent
+      // another run may have saved newer cookies while this one waited
+      if (taken.has(dir) && (await stat(JAR)).mtimeMs !== taken.get(dir))
+        args = [...YTDLP, ...(await jar(dir))]
+
+      await status('downloading')
+      await Bun.write(join(dir, 'info.json'), saved(v, json))
+      // yt-dlp holds a download to --max-filesize only by its Content-Length,
+      // so an HLS or DASH one of unknown size (a stream recording) would grow
+      // until the time limit, many GB into TMP. Every 5 s the job's files are
+      // weighed, and once one of them is over LIMIT the download stops: that
+      // file alone can't be sent. (Their sum would stop a merge that's fine:
+      // the parts and the merged copy are on disk together.) It's the
+      // download as it comes that's judged, as by --max-filesize: an MPEG-TS
+      // one just over LIMIT, which the remux into MP4 would shrink a few %
+      // under it, stops too.
+      const big = new AbortController()
+      const weigh = setInterval(async () => {
+        if ((await biggest(dir)) > LIMIT)
+          big.abort(new Fail('tooBig', `a file over ${LIMIT >> 20} MB`))
+      }, MINUTE / 12)
+      const grab = (source: string[], timeout: number) =>
+        ytdlp(
+          [
+            ...args,
+            ...source,
+            '-o', join(dir, 'v.%(ext)s'),
+            '--max-filesize', String(LIMIT),
+            '--print', 'after_move:filepath',
+          ],
+          timeout,
+          big.signal,
+        )
+      const fetched = Date.now()
+      const age = fetched - extracted
+      const budget = downloadMinutes(long) * MINUTE
+      // The page read again in left ms, then downloaded from like the first
+      // time. It's read apart from the download to see what it picks: the
+      // failed try's files are left to resume only for the same pick, and
+      // deleted first for another (samePick). --no-continue would be no way
+      // out: a fragment download (HLS, DASH) starts over then, but appended
+      // to a .part with bytes in it, which yt-dlp has opened in append mode.
+      // Another video picked this time (a multi-video post whose first one
+      // has changed, or a link that leads to another one now) gets the
+      // checks the first one got (vet: a cached copy of it goes out instead
+      // of a download, and a refresh stops), then becomes the job's video:
+      // it goes out with its own title, length and kind, and is cached under
+      // its own key, never the first one's.
+      const again = async (left: number) => {
+        const reading = Date.now()
+        const page = (await ytdlp([...args, '-J', url], left)).out
+        const pick = picked(JSON.parse(page))
+        const same = samePick(v, pick)
+        log[same ? 'kept' : 'dropped'] = await onDisk(dir)
+        if (!same) await drop(dir)
+        if (cacheKey(pick) !== id) {
+          log.other = 1
+          const hit = await vet(pick)
+          if (hit) return hit
+          v = pick
+          id = cacheKey(pick)
+        }
+        await Bun.write(join(dir, 'info.json'), saved(pick, page))
+        return grab(['--load-info-json', join(dir, 'info.json')], left - (Date.now() - reading))
+      }
+      const got = await grab(
+        [
+          '--load-info-json', join(dir, 'info.json'),
+          // a fragment lost to an expired link fails it (and it reads the page
+          // again) rather than leave a gap in the video
+          ...(stale(age) ? ['--abort-on-unavailable-fragments'] : []),
+        ],
+        budget,
+      )
+        .catch((e) => {
+          // too big: the page read again has the same video
+          if (big.signal.aborted) throw big.signal.reason
+          const left = budget - (Date.now() - fetched)
+          if (!reread(age, left)) throw e
+          log.reread = 1
+          return again(left)
+        })
+        .catch(async (e) => {
+          // how far a failed download got, for the site's speed
+          log.dl = elapsed(fetched)
+          log.mb = await onDisk(dir)
+          throw e
+        })
+        .finally(() => clearInterval(weigh))
+      log.dl = elapsed(fetched)
+      // the page read again picked another video, which went out from the cache
+      if ('file_id' in got) return got
+      const { out, err } = got
+      const path = out.trim().split('\n').pop()
+      // --print implies --quiet, so a file over --max-filesize is skipped
+      // with exit 0 and no output at all
+      if (!path || !existsSync(path)) {
+        log.mb = await onDisk(dir)
+        throw new Fail(err.trim() ? 'failed' : 'tooBig', err)
+      }
+      const bytes = (await stat(path)).size
+      log.mb = Math.round(bytes / 2 ** 20)
+      if (bytes > LIMIT) throw new Fail('tooBig')
+
+      const sending = Date.now()
+      await status('uploading')
+      await SCRATCH.open(path, true)
+      const audio = v.vcodec === 'none'
+      const thumb = join(dir, 'thumb.jpg')
+      const box = audio ? undefined : await probe(path)
+      if (!audio)
+        await Bun.spawn([
+          'ffmpeg', '-v', 'error', '-y',
+          '-ss', String(Math.min(1, (v.duration ?? 0) / 2)),
+          '-i', path,
+          '-frames:v', '1',
+          '-vf', THUMB,
+          thumb,
+        ]).exited
+      const f = { title: v.title || 'Video', url: v.webpage_url || url }
+      // Past the exit's cut the job's chats have heard to send the link
+      // again, or hear it now (a guest reply, a request that came after the
+      // cut): an upload begun now would go out next to that, finished by a
+      // local Bot API server after the exit, and a refresh would leave both
+      // videos. Once the upload has begun (before the cut), the cut leaves
+      // the job's request alone (cutOff).
+      if (exiting) throw new Fail('restarting')
+      dest.uploading = true
+      const [kind, file_id] = await send(
+        dest,
+        audio ? 'audio' : 'video',
+        () => SCRATCH.local(path) ?? new InputFile(path),
+        {
+          ...options(dest, f),
+          width: box?.width ?? v.width ?? undefined,
+          height: box?.height ?? v.height ?? undefined,
+          duration: v.duration ? Math.round(v.duration) : undefined,
+          thumbnail: existsSync(thumb) ? new InputFile(thumb) : undefined,
+          title: audio ? f.title : undefined,
+          performer: audio ? v.uploader : undefined,
+        },
+      )
+      log.up = elapsed(sending)
+      const file = { ...f, kind, file_id }
+      settle(file_id)
+      put(id, file)
+      put(url, file)
+      return file
+    } finally {
+      await saveJar(dir).catch(console.error)
+      // the slot is held until the files are gone; a failed rm is logged, and
+      // the job keeps its own result
+      await rm(dir, { recursive: true, force: true }).catch(console.error).finally(free)
+    }
+  }
+
+  // Puts the file into dest.chat: from the cache, from a running job for the
+  // same link, or downloaded now. status(key, true) is that running job's
+  // status: shown only where a queued one would be.
+  async function deliver(
+    dest: Dest,
+    url: string,
+    status: (key: Key, follow?: boolean) => Promise<void>,
+  ): Promise<File> {
+    const cached = get.get(url)
+    if (cached && (await resend(dest, cached, (message) => (dest.stale = { message, file_id: cached.file_id }))))
+      return dest.stale ? refresh(dest, url, cached) : cached
+    const job = jobs.get(url)
+    if (job) {
+      const f = await follow(url, job, status)
+      if (!(await resend(dest, f))) throw new Fail('failed')
+      return f
+    }
+    const watch = { key: undefined as Key | undefined, tell: new Set<(key: Key) => void>() }
+    watching.set(url, watch)
+    const fresh = download(dest, url, (key) => {
+      watch.key = key
+      for (const tell of watch.tell) tell(key)
+      return status(key)
+    }).finally(() => {
+      jobs.delete(url)
+      watching.delete(url)
+    })
+    jobs.set(url, fresh)
+    return fresh
+  }
+
+  // Waits for the job of another request for the link, this one's status
+  // following the job's: the job's status so far at once, then each new one
+  async function follow(
+    url: string,
+    job: Promise<File>,
+    status: (key: Key, follow?: boolean) => Promise<void>,
+  ) {
+    const watch = watching.get(url)
+    let told = Promise.resolve()
+    const tell = (key: Key) => {
+      told = told.then(() => status(key, true)).catch(() => {})
+    }
+    if (watch?.key) tell(watch.key)
+    watch?.tell.add(tell)
+    try {
+      return await job
+    } finally {
+      watch?.tell.delete(tell)
+      // the status is up before the caller edits or deletes it
+      await told
+    }
+  }
+
+  // The unsized video already went out: a fresh download replaces it, and if
+  // that fails the old one stays, cached as before (and not tried again)
+  async function refresh(dest: Dest, url: string, old: File) {
+    console.error('refresh unsized', url)
+    try {
+      const f = await download(dest, url, async () => {})
+      swap(old.file_id, f)
+      const stale = dest.stale!.message
+      void unsend(() => bot.api.deleteMessage(dest.chat, stale))
+      return f
+    } catch (e) {
+      console.error('refresh failed', url, (e as Error).message)
+      return old
+    } finally {
+      dest.stale = undefined
+    }
+  }
+
+  async function handle(ctx: Context, url: string) {
+    const lang = ctx.from?.language_code
+    let statusId: number | undefined
+    const show = async (key: Key, follow = false, signal?: Signal) => {
+      if (
+        !statusId &&
+        (follow || key === 'queued' || key === 'restarting') &&
+        !tellQueued(ctx.chat!.type, summoned(ctx.msg!, ctx.me.username))
+      )
+        return
+      if (statusId)
+        await ctx.api
+          .editMessageText(ctx.chat!.id, statusId, t(lang, key), undefined, signal)
+          .catch(() => {})
+      else
+        statusId = (
+          await ctx.reply(
+            t(lang, key),
+            {
+              reply_parameters: {
+                message_id: ctx.msg!.message_id,
+                allow_sending_without_reply: true,
+              },
+            },
+            signal,
+          )
+        ).message_id
+    }
+    // Status calls go one at a time, each after the one before it (the exit's
+    // notice too); once the exit cuts the request off, the chat keeps that
+    let shown = Promise.resolve()
+    const then = <T>(call: () => Promise<T>) => {
+      const p = shown.then(call)
+      shown = p.then(() => {}, () => {})
+      return p
+    }
+    let cut = false
+    // progress isn't worth a flood wait; the answer to a failure still waits
+    // its turn
+    const status = (key: Key, follow = false) =>
+      then(() =>
+        cut ? Promise.resolve() : progress(flood.flooded(ctx.chat!.id), (signal) => show(key, follow, signal)),
+      )
+    const d = ctx.from
+      ? promo.decide(ctx.from.id, ctx.chat!.type, lang)
+      : null
+    const dest: Dest = {
+      chat: ctx.chat!.id,
+      reply: ctx.msg!.message_id,
+      promo: d?.promo,
+      // anonymous admins and channel posts all come from one bot user
+      who: ctx.msg!.sender_chat?.id ?? ctx.from?.id,
+    }
+    // The exit cuts off a request whose job hasn't begun its upload (past
+    // the cut none begins one: job()), "⏫" or not. A request that has ended
+    // (its final status or delete on its way), whose chat has its file (a
+    // refresh may still run) or whose own job has begun the upload (a local
+    // Bot API server finishes one by path after the exit) is left alone. One
+    // following another request's job is cut: its own copy goes out only
+    // after that job's.
+    let ended = false
+    const cutOff = () => {
+      if (ended || dest.sent || dest.uploading) return
+      cut = true
+      void then(() =>
+        progress(flood.flooded(ctx.chat!.id), (signal) => show('restarting', false, signal)),
+      ).catch(() => {})
+    }
+    open.add(cutOff)
+    try {
+      await deliver(dest, url, status)
+      ended = true
+      promo.record(d)
+      if (ctx.from && ctx.chat!.type === 'private') promo.used(ctx.from.id)
+      // a status still on its way is up before it goes, the exit's notice too
+      await shown
+      if (statusId)
+        await ctx.api.deleteMessage(ctx.chat!.id, statusId).catch(() => {})
+    } catch (e) {
+      ended = true
+      console.error('failed', url, (e as Error).message)
+      const key = answer(
+        e instanceof Fail ? e.key : 'failed',
+        ctx.chat!.type,
+        summoned(ctx.msg!, ctx.me.username),
+        (e as Error).message,
+      )
+      if (key) await then(() => (cut ? Promise.resolve() : show(key))).catch(() => {})
+      // nothing to say (a tweet without a video), but a status may be up (it
+      // waited for a -J turn): it goes, as on success
+      else
+        await then(async () => {
+          if (!cut && statusId) await ctx.api.deleteMessage(ctx.chat!.id, statusId)
+        }).catch(() => {})
+    } finally {
+      open.delete(cutOff)
+    }
+  }
+
+  // Guest mode: the bot gets one reply in a chat it isn't in. It answers with
+  // a status text at once and edits the video into it when it's ready.
+  async function guest(ctx: Context) {
+    const msg = ctx.guestMessage!
+    const lang = ctx.from?.language_code
+    const url = links(msg, ctx.me.username, true)[0]
+    const { inline_message_id: id } = await ctx.answerGuestQuery({
+      type: 'article',
+      id: 'status',
+      title: ctx.me.first_name,
+      input_message_content: {
+        message_text: t(lang, url ? 'downloading' : 'help'),
+      },
+    })
+    if (!url) return
+    const status = (key: Key, signal?: Signal) =>
+      ctx.api
+        .editMessageTextInline(id, t(lang, key), undefined, signal)
+        .then(() => {}, () => {})
+    if (!STORAGE) return status('failed')
+    const dest: Dest = { chat: STORAGE, who: ctx.from?.id }
+    try {
+      // progress isn't worth a flood wait, as in handle()
+      const f = await deliver(dest, url, (key) => status(key, PROGRESS))
+      const { caption, parse_mode } = options(dest, f)!
+      await ctx.api.editMessageMediaInline(id, {
+        type: f.kind,
+        media: f.file_id,
+        caption,
+        parse_mode,
+      } as InputMediaVideo)
+    } catch (e) {
+      console.error('guest failed', url, (e as Error).message)
+      await status((e instanceof Fail && e.key) || 'failed')
+    } finally {
+      // detached: a long flood wait mustn't hold the handler (and a deploy's drain)
+      const sent = dest.sent
+      if (sent) void unsend(() => bot.api.deleteMessage(dest.chat, sent))
+    }
+  }
+
+  bot.use((ctx, next) => {
+    try {
+      const m = ctx.myChatMember
+      if (m && m.chat.type === 'private') people.member(m.chat.id, m.new_chat_member.status)
+      else if (!m) people.seen(ctx.chat?.id, ctx.from?.id, ctx.chat?.type)
+    } catch (e) {
+      console.error(e) // a stats write never blocks a download
+    }
+    return next()
+  })
+  const created = db.query<{ created: number }, [number]>('SELECT created FROM chats WHERE id = ?')
+  bot.command(['start', 'help'], (ctx) => {
+    // a /start from another bot's campaign link (promo.ts); the census above has just added a new chat
+    if (ctx.chat.type === 'private' && ctx.from && ctx.match)
+      promo.arrived(ctx.from.id, ctx.match, Date.now() / 1000 - (created.get(ctx.chat.id)?.created ?? 0) < 600)
+    help(ctx)
+  })
+  bot.on('message', (ctx) => {
+    const found = links(ctx.msg, ctx.me.username)
+    // handlers run detached so one long download doesn't block the next update
+    void track(
+      requested(ctx.msg, ctx.me.username, ctx.chat.type)
+        .then((wanted) => wanted.forEach((url) => void track(handle(ctx, url))))
+        .catch(console.error),
+    )
+    if (!found.length && ctx.chat.type === 'private') help(ctx)
+  })
+  bot.on('guest_message', (ctx) => void track(guest(ctx).catch(console.error)))
+  bot.on('my_chat_member', (ctx) => {
+    const was = ctx.myChatMember.old_chat_member.status
+    const now = ctx.myChatMember.new_chat_member.status
+    if (ctx.chat.type === 'private' && now === 'kicked') promo.blocked(ctx.from.id)
+    if (
+      ctx.chat.type !== 'private' &&
+      (was === 'left' || was === 'kicked') &&
+      (now === 'member' || now === 'administrator')
+    )
+      help(ctx)
+  })
+  bot.catch((e) => console.error(e.error))
+
+  setInterval(() => selfUpdate(updateOnce), 24 * 3600_000)
+  void promo.refresh()
+  setInterval(promo.refresh, 5 * 60_000)
+  setInterval(promo.flush, 60_000)
+
+  // Keeps the YouTube session in use so it doesn't go stale; Watch Later only
+  // opens when logged in. If Google kills the session anyway, tell ADMIN_ID.
+  async function keepalive() {
+    if (!existsSync(JAR)) return
+    const dir = await mkdtemp(join(TMP, 'keepalive-'))
+    try {
+      await ytdlp([
+        ...(await jar(dir)),
+        '--js-runtimes', 'bun', '--flat-playlist', '-I', '1', '-J',
+        'https://www.youtube.com/playlist?list=WL',
+      ])
+      await saveJar(dir)
+    } catch (e) {
+      const why = `YouTube cookies look logged out, refresh COOKIES: ${(e as Error).message}`
+      console.error(why)
+      if (env.ADMIN_ID)
+        await bot.api.sendMessage(env.ADMIN_ID, `⚠️ ${why}`).catch(console.error)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+  // Polling and the shared cookie jar's keepalive run only on the container
+  // holding the polling lock; bot.stop() confirms the fetched updates. They
+  // begin once the first self-update try is over, while a failed one's
+  // retries go on (yt-dlp runs wait for a try, not for the pauses between).
+  return selfUpdate(updateOnce).first.then(() =>
+    pollWithHandover(
+      () => {
+        setInterval(keepalive, 6 * 3600_000)
+        void keepalive()
+        return bot.start({
+          allowed_updates: ['message', 'guest_message', 'my_chat_member'],
+          onStart: (me) => console.log(`@${me.username} up, uploads ≤ ${LIMIT >> 20} MB`),
+        })
+      },
+      () => bot.stop(),
+      async () => {
+        // the links still waiting for a yt-dlp -J turn or a slot won't get
+        // one here (the new container polls by now), nor will a long video
+        // (it couldn't finish before the exit): they hear so rather than stay
+        // "in the queue". A short one that finds a free turn still goes.
+        console.log(`draining ${running}`)
+        meta.close(new Fail('restarting'))
+        slots.close(new Fail('restarting'))
+        // the jobs still running 2 s before the exit won't finish: their
+        // chats hear so the same way, rather than keep "Downloading…", and
+        // from then on no upload begins
+        // (CUT_MS moves the cut: bot.e2e.test.ts cuts at once, reading the
+        // "cut" line, and ends the drain itself)
+        const exit = setTimeout(
+          () => {
+            exiting = true
+            console.log(`cut ${open.size}`)
+            open.forEach((cut) => cut())
+          },
+          Number(env.CUT_MS ?? DRAIN - 2_000),
+        )
+        while (running) await Bun.sleep(100)
+        clearTimeout(exit)
+        await promo.flush()
+      },
+    ),
+  )
+}
+
+if (import.meta.main) {
+  if (!env.EGRESS_DENY?.trim())
+    console.warn("EGRESS_DENY is empty: the host's own public addresses are reachable")
+  await SCRATCH.start()
+  await mkdir(DATA, { recursive: true })
+  await seedJar()
+  await main()
+}
